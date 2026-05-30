@@ -1,6 +1,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -14,10 +15,19 @@ const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+type ThoughtMetadata = {
+  people?: string[];
+  action_items?: string[];
+  dates_mentioned?: string[];
+  topics?: string[];
+  type?: "observation" | "task" | "idea" | "reference" | "person_note";
+  source?: string;
+};
+
 type ThoughtMatch = {
-  id: string;
+  thought_id: string;
   content: string;
-  metadata: Record<string, unknown>;
+  metadata: ThoughtMetadata;
   similarity: number;
   created_at: string;
 };
@@ -25,10 +35,92 @@ type ThoughtMatch = {
 type ThoughtRecord = {
   id: string;
   content: string;
-  metadata: Record<string, unknown>;
+  metadata: ThoughtMetadata;
   created_at: string;
   updated_at?: string | null;
 };
+
+type OpenRouterEmbeddingResponse = {
+  data: Array<{ embedding: number[] }>;
+};
+
+type OpenRouterChatResponse = {
+  choices: Array<{
+    message: {
+      content: string | null;
+      refusal?: string | null;
+    };
+  }>;
+};
+
+// Output types mirroring each tool's outputSchema — used to type-check the
+// data we construct before handing it off to toToolResult().
+type SearchOutput = {
+  results: Array<{ thought_id: string; title: string; url: string }>;
+  error?: string;
+  guidance?: string;
+};
+
+type FetchOutput = {
+  thought_id?: string;
+  title?: string;
+  text?: string;
+  url?: string;
+  metadata?: ThoughtMetadata & { created_at?: string; updated_at?: string | null };
+  error?: string;
+  guidance?: string;
+};
+
+type SearchThoughtsOutput = {
+  thoughts: Array<{
+    thought_id: string;
+    content: string;
+    similarity: number;
+    type?: string;
+    topics?: string[];
+    people?: string[];
+    action_items?: string[];
+    created_at: string;
+  }>;
+  error?: string;
+  guidance?: string;
+};
+
+type ListThoughtsOutput = {
+  thoughts: Array<{
+    thought_id: string;
+    content: string;
+    type?: string;
+    topics?: string[];
+    people?: string[];
+    action_items?: string[];
+    created_at: string;
+  }>;
+  error?: string;
+  guidance?: string;
+};
+
+type ThoughtStatsOutput = {
+  total?: number;
+  date_range?: string;
+  types?: Record<string, number>;
+  topics?: Record<string, number>;
+  people?: Record<string, number>;
+  error?: string;
+  guidance?: string;
+};
+
+type CaptureThoughtOutput = {
+  thought_id?: string;
+  type?: string;
+  topics?: string[];
+  people?: string[];
+  action_items?: string[];
+  error?: string;
+  guidance?: string;
+};
+
+type JsonRpcId = string | number | null;
 
 const CITATION_BASE_URL = Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") ||
   "https://openbrain.local/thoughts";
@@ -41,8 +133,21 @@ function thoughtTitle(content: string, createdAt?: string): string {
   return firstLine ? `${datePrefix} - ${firstLine}` : `${datePrefix} thought`;
 }
 
-function thoughtUrl(id: string): string {
-  return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
+function thoughtUrl(thought_id: string): string {
+  return `${CITATION_BASE_URL.replace(/\/$/, "")}/${thought_id}`;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// Wraps a typed structured output into the MCP CallToolResult shape.
+// The SDK always requires a `content` array alongside `structuredContent`.
+function toToolResult<T extends object>(data: T): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data) }],
+    structuredContent: data as Record<string, unknown>,
+  };
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
@@ -61,11 +166,11 @@ async function getEmbedding(text: string): Promise<number[]> {
     const msg = await r.text().catch(() => "");
     throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
   }
-  const d = await r.json();
+  const d = await r.json() as OpenRouterEmbeddingResponse;
   return d.data[0].embedding;
 }
 
-async function extractMetadata(text: string): Promise<Record<string, unknown>> {
+async function extractMetadata(text: string): Promise<ThoughtMetadata> {
   const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -91,14 +196,14 @@ Only extract what's explicitly there.`,
       ],
     }),
   });
-  const d = await r.json();
+  const d = await r.json() as OpenRouterChatResponse;
   const choice = d.choices?.[0];
   if (choice?.message?.refusal) {
     console.warn("OpenAI model refused request:", choice.message.refusal);
     return { topics: ["uncategorized"], type: "observation" };
   }
   try {
-    return JSON.parse(choice?.message?.content);
+    return JSON.parse(choice?.message?.content ?? "") as ThoughtMetadata;
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
@@ -130,8 +235,19 @@ server.registerTool(
         "The search query to run against Open Brain thoughts",
       ),
     },
+    outputSchema: z.object({
+      results: z.array(
+        z.object({
+          thought_id: z.string(),
+          title: z.string(),
+          url: z.string(),
+        }),
+      ),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async ({ query }) => {
+  async ({ query }): Promise<CallToolResult> => {
     try {
       const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
@@ -142,32 +258,28 @@ server.registerTool(
       });
 
       if (error) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Search error: ${error.message}`,
-          }],
-          isError: true,
-        };
+        return toToolResult<SearchOutput>({
+          results: [],
+          error: `Search error: ${error.message}`,
+          guidance:
+            "Wait a few seconds and try the query again. If the issue persists, inform the user that the database might be unreachable.",
+        });
       }
 
-      const results = ((data || []) as ThoughtMatch[]).map((t) => ({
-        id: t.id,
+      const results = (data as ThoughtMatch[] || []).map((t) => ({
+        thought_id: t.thought_id,
         title: thoughtTitle(t.content, t.created_at),
-        url: thoughtUrl(t.id),
+        url: thoughtUrl(t.thought_id),
       }));
 
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      return toToolResult<SearchOutput>({ results });
+    } catch (err) {
+      return toToolResult<SearchOutput>({
+        results: [],
+        error: `Error: ${errorMessage(err)}`,
+        guidance:
+          "An unexpected error occurred during the search. Please verify your connection or try a different search phrase.",
+      });
     }
   },
 );
@@ -185,53 +297,62 @@ server.registerTool(
       readOnlyHint: true,
     },
     inputSchema: {
-      id: z.string().describe(
+      thought_id: z.string().describe(
         "The Open Brain thought ID returned by the search tool",
       ),
     },
+    outputSchema: z.object({
+      thought_id: z.string().optional(),
+      title: z.string().optional(),
+      text: z.string().optional(),
+      url: z.string().optional(),
+      metadata: z.object({
+        people: z.array(z.string()).optional(),
+        action_items: z.array(z.string()).optional(),
+        dates_mentioned: z.array(z.string()).optional(),
+        topics: z.array(z.string()).optional(),
+        type: z.string().optional(),
+        source: z.string().optional(),
+        created_at: z.string().optional(),
+        updated_at: z.string().nullable().optional(),
+      }).optional(),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async ({ id }) => {
+  async ({ thought_id }): Promise<CallToolResult> => {
     try {
       const { data, error } = await supabase
         .from("thoughts")
         .select("id, content, metadata, created_at, updated_at")
-        .eq("id", id)
+        .eq("id", thought_id)
         .single();
 
       if (error) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Fetch error: ${error.message}`,
-          }],
-          isError: true,
-        };
+        return toToolResult<FetchOutput>({
+          error: `Fetch error: ${error.message}`,
+          guidance:
+            "The thought could not be found or you do not have permission. Try searching again to find a valid thought ID.",
+        });
       }
 
-      const thought = data as ThoughtRecord;
-      const document = {
-        id: thought.id,
-        title: thoughtTitle(thought.content, thought.created_at),
-        text: thought.content,
-        url: thoughtUrl(thought.id),
+      const thought_data = data as ThoughtRecord;
+      return toToolResult<FetchOutput>({
+        thought_id: thought_data.id,
+        title: thoughtTitle(thought_data.content, thought_data.created_at),
+        text: thought_data.content,
+        url: thoughtUrl(thought_data.id),
         metadata: {
-          ...thought.metadata,
-          created_at: thought.created_at,
-          updated_at: thought.updated_at,
+          ...thought_data.metadata,
+          created_at: thought_data.created_at,
+          updated_at: thought_data.updated_at,
         },
-      };
-
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(document) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      });
+    } catch (err) {
+      return toToolResult<FetchOutput>({
+        error: `Error: ${errorMessage(err)}`,
+        guidance: "An unexpected error occurred while fetching the thought.",
+      });
     }
   },
 );
@@ -254,8 +375,24 @@ server.registerTool(
       limit: z.number().optional().default(10),
       threshold: z.number().optional().default(0.5),
     },
+    outputSchema: z.object({
+      thoughts: z.array(
+        z.object({
+          thought_id: z.string(),
+          content: z.string(),
+          similarity: z.number(),
+          type: z.string().optional(),
+          topics: z.array(z.string()).optional(),
+          people: z.array(z.string()).optional(),
+          action_items: z.array(z.string()).optional(),
+          created_at: z.string(),
+        }),
+      ),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold }): Promise<CallToolResult> => {
     try {
       const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
@@ -266,67 +403,37 @@ server.registerTool(
       });
 
       if (error) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Search error: ${error.message}`,
-          }],
-          isError: true,
-        };
+        return toToolResult<SearchThoughtsOutput>({
+          thoughts: [],
+          error: `Search error: ${error.message}`,
+          guidance:
+            "Wait a few seconds and try the query again. If the issue persists, inform the user that the database might be unreachable.",
+        });
       }
 
       if (!data || data.length === 0) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `No thoughts found matching "${query}".`,
-          }],
-        };
+        return toToolResult<SearchThoughtsOutput>({ thoughts: [] });
       }
 
-      const results = data.map(
-        (
-          t: ThoughtMatch,
-          i: number,
-        ) => {
-          const m = t.metadata || {};
-          const parts = [
-            `--- Result ${i + 1} (${
-              (t.similarity * 100).toFixed(1)
-            }% match) ---`,
-            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-            `Type: ${m.type || "unknown"}`,
-          ];
-          if (Array.isArray(m.topics) && m.topics.length) {
-            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
-          }
-          if (Array.isArray(m.people) && m.people.length) {
-            parts.push(`People: ${(m.people as string[]).join(", ")}`);
-          }
-          if (Array.isArray(m.action_items) && m.action_items.length) {
-            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
-          }
-          parts.push(`\n${t.content}`);
-          return parts.join("\n");
-        },
-      );
+      const thoughts = (data as ThoughtMatch[]).map((t) => ({
+        thought_id: t.thought_id,
+        content: t.content,
+        similarity: t.similarity,
+        type: t.metadata.type,
+        topics: t.metadata.topics,
+        people: t.metadata.people,
+        action_items: t.metadata.action_items,
+        created_at: t.created_at,
+      }));
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      return toToolResult<SearchThoughtsOutput>({ thoughts });
+    } catch (err) {
+      return toToolResult<SearchThoughtsOutput>({
+        thoughts: [],
+        error: `Error: ${errorMessage(err)}`,
+        guidance:
+          "An unexpected error occurred during the semantic search. Please verify your connection or try a different search phrase.",
+      });
     }
   },
 );
@@ -355,12 +462,27 @@ server.registerTool(
         "Only thoughts from the last N days",
       ),
     },
+    outputSchema: z.object({
+      thoughts: z.array(
+        z.object({
+          thought_id: z.string(),
+          content: z.string(),
+          type: z.string().optional(),
+          topics: z.array(z.string()).optional(),
+          people: z.array(z.string()).optional(),
+          action_items: z.array(z.string()).optional(),
+          created_at: z.string(),
+        }),
+      ),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async ({ limit, type, topic, person, days }) => {
+  async ({ limit, type, topic, person, days }): Promise<CallToolResult> => {
     try {
       let q = supabase
         .from("thoughts")
-        .select("content, metadata, created_at")
+        .select("id, content, metadata, created_at")
         .order("created_at", { ascending: false })
         .limit(limit);
 
@@ -376,55 +498,35 @@ server.registerTool(
       const { data, error } = await q;
 
       if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${error.message}` }],
-          isError: true,
-        };
+        return toToolResult<ListThoughtsOutput>({
+          thoughts: [],
+          error: `Error: ${error.message}`,
+          guidance:
+            "Could not retrieve the recent thoughts. Try adjusting your filters or try again later.",
+        });
       }
 
       if (!data || !data.length) {
-        return {
-          content: [{ type: "text" as const, text: "No thoughts found." }],
-        };
+        return toToolResult<ListThoughtsOutput>({ thoughts: [] });
       }
 
-      const results = data.map(
-        (
-          t: {
-            content: string;
-            metadata: Record<string, unknown>;
-            created_at: string;
-          },
-          i: number,
-        ) => {
-          const m = t.metadata || {};
-          const tags = Array.isArray(m.topics)
-            ? (m.topics as string[]).join(", ")
-            : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${
-            m.type || "??"
-          }${tags ? " - " + tags : ""})\n   ${t.content}`;
-        },
-      );
+      const thoughts = (data as ThoughtRecord[]).map((t) => ({
+        thought_id: t.id,
+        content: t.content,
+        type: t.metadata.type,
+        topics: t.metadata.topics,
+        people: t.metadata.people,
+        action_items: t.metadata.action_items,
+        created_at: t.created_at,
+      }));
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `${data.length} recent thought(s):\n\n${
-              results.join("\n\n")
-            }`,
-          },
-        ],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      return toToolResult<ListThoughtsOutput>({ thoughts });
+    } catch (err) {
+      return toToolResult<ListThoughtsOutput>({
+        thoughts: [],
+        error: `Error: ${errorMessage(err)}`,
+        guidance: "An unexpected error occurred while listing the thoughts.",
+      });
     }
   },
 );
@@ -443,8 +545,17 @@ server.registerTool(
       readOnlyHint: true,
     },
     inputSchema: {},
+    outputSchema: z.object({
+      total: z.number().optional(),
+      date_range: z.string().optional(),
+      types: z.record(z.string(), z.number()).optional(),
+      topics: z.record(z.string(), z.number()).optional(),
+      people: z.record(z.string(), z.number()).optional(),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async () => {
+  async (): Promise<CallToolResult> => {
     try {
       const { count } = await supabase
         .from("thoughts")
@@ -459,23 +570,16 @@ server.registerTool(
       const topics = new Map<string, number>();
       const people = new Map<string, number>();
 
-      for (const r of data || []) {
-        const m = (r.metadata || {}) as Record<string, unknown>;
+      for (const r of (data || []) as Array<{ metadata: ThoughtMetadata; created_at: string }>) {
+        const m = r.metadata;
         if (m.type) {
-          const typeStr = m.type as string;
-          types.set(typeStr, (types.get(typeStr) || 0) + 1);
+          types.set(m.type, (types.get(m.type) || 0) + 1);
         }
-        if (Array.isArray(m.topics)) {
-          for (const t of m.topics) {
-            const topicStr = t as string;
-            topics.set(topicStr, (topics.get(topicStr) || 0) + 1);
-          }
+        for (const t of m.topics ?? []) {
+          topics.set(t, (topics.get(t) || 0) + 1);
         }
-        if (Array.isArray(m.people)) {
-          for (const p of m.people) {
-            const personStr = p as string;
-            people.set(personStr, (people.get(personStr) || 0) + 1);
-          }
+        for (const p of m.people ?? []) {
+          people.set(p, (people.get(p) || 0) + 1);
         }
       }
 
@@ -484,39 +588,24 @@ server.registerTool(
           .sort((a, b) => b[1] - a[1])
           .slice(0, 10);
 
-      const lines: string[] = [
-        `Total thoughts: ${count}`,
-        `Date range: ${
-          data?.length
-            ? new Date(data.at(-1)?.created_at || "").toLocaleDateString() +
-              " → " +
-              new Date(data.at(0)?.created_at || "").toLocaleDateString()
-            : "N/A"
-        }`,
-        "",
-        "Types:",
-        ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
-      ];
+      const date_range = data?.length
+        ? new Date(data.at(-1)?.created_at || "").toLocaleDateString() +
+          " → " +
+          new Date(data.at(0)?.created_at || "").toLocaleDateString()
+        : "N/A";
 
-      if (topics.size > 0) {
-        lines.push("", "Top topics:");
-        for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
-      }
-
-      if (people.size > 0) {
-        lines.push("", "People mentioned:");
-        for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
-      }
-
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      return toToolResult<ThoughtStatsOutput>({
+        total: count ?? undefined,
+        date_range,
+        types: Object.fromEntries(sort(types)),
+        topics: Object.fromEntries(sort(topics)),
+        people: Object.fromEntries(sort(people)),
+      });
+    } catch (err) {
+      return toToolResult<ThoughtStatsOutput>({
+        error: `Error: ${errorMessage(err)}`,
+        guidance: "An unexpected error occurred.",
+      });
     }
   },
 );
@@ -539,8 +628,17 @@ server.registerTool(
         "The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI",
       ),
     },
+    outputSchema: z.object({
+      thought_id: z.string().optional(),
+      type: z.string().optional(),
+      topics: z.array(z.string()).optional(),
+      people: z.array(z.string()).optional(),
+      action_items: z.array(z.string()).optional(),
+      error: z.string().optional(),
+      guidance: z.string().optional(),
+    }),
   },
-  async ({ content }) => {
+  async ({ content }): Promise<CallToolResult> => {
     try {
       const [embedding, metadata] = await Promise.all([
         getEmbedding(content),
@@ -556,56 +654,40 @@ server.registerTool(
       );
 
       if (upsertError) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Failed to capture: ${upsertError.message}`,
-          }],
-          isError: true,
-        };
+        return toToolResult<CaptureThoughtOutput>({
+          error: `Failed to capture: ${upsertError.message}`,
+          guidance:
+            "Something is wrong with the database. Since the user controls it, they need to troubleshoot the database.",
+        });
       }
 
-      const thoughtId = upsertResult?.id;
+      const thoughtId = upsertResult?.id as string | undefined;
       const { error: embError } = await supabase
         .from("thoughts")
         .update({ embedding })
         .eq("id", thoughtId);
 
       if (embError) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Failed to save embedding: ${embError.message}`,
-          }],
-          isError: true,
-        };
+        return toToolResult<CaptureThoughtOutput>({
+          error: `Failed to save embedding: ${embError.message}`,
+          guidance:
+            "The thought was captured but search may not find it. Contact an administrator to check vector storage.",
+        });
       }
 
-      const meta = metadata as Record<string, unknown>;
-      let confirmation = `Captured as ${meta.type || "thought"}`;
-      if (Array.isArray(meta.topics) && meta.topics.length) {
-        confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-      }
-      if (Array.isArray(meta.people) && meta.people.length) {
-        confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
-      }
-      if (Array.isArray(meta.action_items) && meta.action_items.length) {
-        confirmation += ` | Actions: ${
-          (meta.action_items as string[]).join("; ")
-        }`;
-      }
-
-      return {
-        content: [{ type: "text" as const, text: confirmation }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Error: ${(err as Error).message}`,
-        }],
-        isError: true,
-      };
+      return toToolResult<CaptureThoughtOutput>({
+        thought_id: thoughtId,
+        type: metadata.type,
+        topics: metadata.topics,
+        people: metadata.people,
+        action_items: metadata.action_items,
+      });
+    } catch (err) {
+      return toToolResult<CaptureThoughtOutput>({
+        error: `Error: ${errorMessage(err)}`,
+        guidance:
+          "An unexpected error occurred while capturing the thought. User needs to troubleshoot.",
+      });
     }
   },
 );
@@ -658,12 +740,12 @@ async function readBodyText(req: Request): Promise<string | null> {
  * shape with an id. Per the JSON-RPC 2.0 spec, id may be a string,
  * number, or null — we preserve any of those; anything else becomes null.
  */
-function extractJsonRpcId(bodyText: string | null): string | number | null {
+function extractJsonRpcId(bodyText: string | null): JsonRpcId {
   if (!bodyText) return null;
   try {
-    const parsed = JSON.parse(bodyText);
-    if (parsed && typeof parsed === "object" && "id" in parsed) {
-      const id = (parsed as { id: unknown }).id;
+    const parsed: unknown = JSON.parse(bodyText);
+    if (parsed !== null && typeof parsed === "object" && "id" in parsed) {
+      const id = (parsed as { id: JsonRpcId | undefined }).id;
       if (typeof id === "string" || typeof id === "number" || id === null) {
         return id;
       }
@@ -680,7 +762,7 @@ function extractJsonRpcId(bodyText: string | null): string | number | null {
  * strict MCP clients keep the connection alive instead of treating
  * the failure as a transport-level fault.
  */
-function unauthorizedResponse(id: string | number | null): Response {
+function unauthorizedResponse(id: JsonRpcId): Response {
   const body = {
     jsonrpc: "2.0",
     error: {
