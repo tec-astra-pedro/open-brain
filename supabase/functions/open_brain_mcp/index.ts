@@ -1,12 +1,18 @@
+// Side-effect import: injects Deno edge-runtime globals (Deno.env, etc.) into
+// TypeScript's type scope. Must be first.
 import "@supabase/functions-js/edge-runtime.d.ts";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+// MCP SDK requirement: all tool handlers must return CallToolResult, which
+// requires both a `content` array (human-readable) and an optional
+// `structuredContent` object (machine-readable, validated against outputSchema).
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
+// ! assertions intentionally throw at startup if any required var is absent.
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
@@ -15,6 +21,8 @@ const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// All fields are optional because the LLM may omit any field that isn't
+// explicitly present in the captured text.
 type ThoughtMetadata = {
   people?: string[];
   action_items?: string[];
@@ -24,6 +32,8 @@ type ThoughtMetadata = {
   source?: string;
 };
 
+// Returned by the match_thoughts Postgres RPC, which aliases the primary key
+// as `thought_id` — distinct from ThoughtRecord which reads `id` directly.
 type ThoughtMatch = {
   thought_id: string;
   content: string;
@@ -120,12 +130,16 @@ type CaptureThoughtOutput = {
   guidance?: string;
 };
 
+// JSON-RPC 2.0 spec §5: id MUST be a string, number, or null.
 type JsonRpcId = string | number | null;
 
+// Falls back to a non-functional placeholder so the server starts in
+// environments that haven't set the var yet; citations simply won't resolve.
 const CITATION_BASE_URL = Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") ||
   "https://openbrain.local/thoughts";
 
 function thoughtTitle(content: string, createdAt?: string): string {
+  // 80 chars keeps titles concise for MCP search results and citation surfaces.
   const firstLine = content.replace(/\s+/g, " ").trim().slice(0, 80);
   const datePrefix = createdAt
     ? new Date(createdAt).toLocaleDateString()
@@ -158,6 +172,7 @@ async function getEmbedding(text: string): Promise<number[]> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      // text-embedding-3-small: good balance of quality and cost for semantic search.
       model: "openai/text-embedding-3-small",
       input: text,
     }),
@@ -178,7 +193,9 @@ async function extractMetadata(text: string): Promise<ThoughtMetadata> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      // gpt-4o-mini: fast and cheap for structured extraction; quality is sufficient.
       model: "openai/gpt-4o-mini",
+      // json_object mode guarantees parseable output and eliminates markdown fences.
       response_format: { type: "json_object" },
       messages: [
         {
@@ -205,12 +222,17 @@ Only extract what's explicitly there.`,
   try {
     return JSON.parse(choice?.message?.content ?? "") as ThoughtMetadata;
   } catch {
+    // Malformed JSON from the model: fall back to safe defaults so the thought
+    // is still captured, just with minimal metadata.
     return { topics: ["uncategorized"], type: "observation" };
   }
 }
 
 // --- MCP Server Setup ---
 
+// One shared McpServer instance for the lifetime of the edge function.
+// A new StreamableHTTPTransport is created per request (see app.all below),
+// so the server is effectively stateless across connections.
 const server = new McpServer({
   name: "open-brain",
   version: "1.0.0",
@@ -224,17 +246,23 @@ server.registerTool(
     title: "Search Open Brain",
     description:
       "Search Open Brain memories by meaning. Use this read-only compatibility tool when ChatGPT needs search/fetch-style access to stored thoughts.",
+    // MCP SDK: annotations are advisory hints that clients use to categorise tools
+    // (e.g. show a lock icon, skip confirmation prompts for read-only calls).
     annotations: {
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
       readOnlyHint: true,
     },
+    // MCP SDK: inputSchema accepts a Zod raw shape (plain object of Zod fields),
+    // NOT a ZodObject. The SDK wraps it in z.object() internally.
     inputSchema: {
       query: z.string().describe(
         "The search query to run against Open Brain thoughts",
       ),
     },
+    // MCP SDK: outputSchema is a full ZodObject. At runtime the SDK validates
+    // structuredContent against this schema before sending the response.
     outputSchema: z.object({
       results: z.array(
         z.object({
@@ -254,7 +282,7 @@ server.registerTool(
         query_embedding: qEmb,
         match_threshold: 0.5,
         match_count: 10,
-        filter: {},
+        filter: {}, // required by the RPC signature; {} means no metadata pre-filter
       });
 
       if (error) {
@@ -342,6 +370,8 @@ server.registerTool(
         title: thoughtTitle(thought_data.content, thought_data.created_at),
         text: thought_data.content,
         url: thoughtUrl(thought_data.id),
+        // Timestamps are merged into metadata so citation clients get full
+        // temporal context in a single object without a separate date field.
         metadata: {
           ...thought_data.metadata,
           created_at: thought_data.created_at,
@@ -399,7 +429,7 @@ server.registerTool(
         query_embedding: qEmb,
         match_threshold: threshold,
         match_count: limit,
-        filter: {},
+        filter: {}, // required by the RPC signature; {} means no metadata pre-filter
       });
 
       if (error) {
@@ -486,6 +516,7 @@ server.registerTool(
         .order("created_at", { ascending: false })
         .limit(limit);
 
+      // .contains() maps to Postgres's @> (JSONB containment) operator.
       if (type) q = q.contains("metadata", { type });
       if (topic) q = q.contains("metadata", { topics: [topic] });
       if (person) q = q.contains("metadata", { people: [person] });
@@ -544,6 +575,8 @@ server.registerTool(
       openWorldHint: false,
       readOnlyHint: true,
     },
+    // MCP SDK requires inputSchema even for tools with no arguments; an empty
+    // shape {} is the correct way to declare a zero-argument tool.
     inputSchema: {},
     outputSchema: z.object({
       total: z.number().optional(),
@@ -557,10 +590,13 @@ server.registerTool(
   },
   async (): Promise<CallToolResult> => {
     try {
+      // head: true returns no rows — just the count — keeping this query cheap.
       const { count } = await supabase
         .from("thoughts")
         .select("*", { count: "exact", head: true });
 
+      // Second query fetches the metadata needed to compute per-type/topic/person
+      // aggregates; these can't be derived from the count query alone.
       const { data } = await supabase
         .from("thoughts")
         .select("metadata, created_at")
@@ -583,11 +619,13 @@ server.registerTool(
         }
       }
 
+      // Top 10 per category keeps the response concise; adjust if needed.
       const sort = (map: Map<string, number>): [string, number][] =>
         Array.from(map.entries())
           .sort((a, b) => b[1] - a[1])
           .slice(0, 10);
 
+      // Results are newest-first, so at(-1) is the oldest and at(0) is the newest.
       const date_range = data?.length
         ? new Date(data.at(-1)?.created_at || "").toLocaleDateString() +
           " → " +
@@ -595,6 +633,8 @@ server.registerTool(
         : "N/A";
 
       return toToolResult<ThoughtStatsOutput>({
+        // Supabase returns null when count is unavailable; coerce to undefined
+        // so the value satisfies z.number().optional() (which rejects null).
         total: count ?? undefined,
         date_range,
         types: Object.fromEntries(sort(types)),
@@ -640,11 +680,14 @@ server.registerTool(
   },
   async ({ content }): Promise<CallToolResult> => {
     try {
+      // Both calls are independent — run them in parallel to halve latency.
       const [embedding, metadata] = await Promise.all([
         getEmbedding(content),
         extractMetadata(content),
       ]);
 
+      // source tag lets the app distinguish thoughts captured via MCP from
+      // those entered directly through the UI.
       const { data: upsertResult, error: upsertError } = await supabase.rpc(
         "upsert_thought",
         {
@@ -661,6 +704,8 @@ server.registerTool(
         });
       }
 
+      // Embedding is written in a separate call because upsert_thought handles
+      // deduplication logic and cannot accept a vector parameter directly.
       const thoughtId = upsertResult?.id as string | undefined;
       const { error: embError } = await supabase
         .from("thoughts")
@@ -818,6 +863,8 @@ app.all("*", async (c) => {
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
 
+  // A new transport is created per request because StreamableHTTPTransport is
+  // stateful per connection; the server instance above is safely reused.
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
