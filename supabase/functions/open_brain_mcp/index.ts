@@ -32,10 +32,10 @@ type ThoughtMetadata = {
   source?: string;
 };
 
-// Returned by the match_thoughts Postgres RPC, which aliases the primary key
-// as `thought_id` — distinct from ThoughtRecord which reads `id` directly.
+// Returned by the match_thoughts Postgres RPC. Uses `id` matching the column
+// name the function returns — distinct from any client-facing `thought_id` alias.
 type ThoughtMatch = {
-  thought_id: string;
+  id: string;
   content: string;
   metadata: ThoughtMetadata;
   similarity: number;
@@ -295,9 +295,9 @@ server.registerTool(
       }
 
       const results = (data as ThoughtMatch[] || []).map((t) => ({
-        thought_id: t.thought_id,
+        thought_id: t.id,
         title: thoughtTitle(t.content, t.created_at),
-        url: thoughtUrl(t.thought_id),
+        url: thoughtUrl(t.id),
       }));
 
       return toToolResult<SearchOutput>({ results });
@@ -446,7 +446,7 @@ server.registerTool(
       }
 
       const thoughts = (data as ThoughtMatch[]).map((t) => ({
-        thought_id: t.thought_id,
+        thought_id: t.id,
         content: t.content,
         similarity: t.similarity,
         type: t.metadata.type,
