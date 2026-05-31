@@ -590,56 +590,37 @@ server.registerTool(
   },
   async (): Promise<CallToolResult> => {
     try {
-      // head: true returns no rows — just the count — keeping this query cheap.
-      const { count } = await supabase
-        .from("thoughts")
-        .select("*", { count: "exact", head: true });
+      // Use RPC for aggregation to avoid O(N) memory usage and latency as the brain grows.
+      const { data, error } = await supabase.rpc("get_thought_stats");
 
-      // Second query fetches the metadata needed to compute per-type/topic/person
-      // aggregates; these can't be derived from the count query alone.
-      const { data } = await supabase
-        .from("thoughts")
-        .select("metadata, created_at")
-        .order("created_at", { ascending: false });
-
-      const types = new Map<string, number>();
-      const topics = new Map<string, number>();
-      const people = new Map<string, number>();
-
-      for (const r of (data || []) as Array<{ metadata: ThoughtMetadata; created_at: string }>) {
-        const m = r.metadata;
-        if (m.type) {
-          types.set(m.type, (types.get(m.type) || 0) + 1);
-        }
-        for (const t of m.topics ?? []) {
-          topics.set(t, (topics.get(t) || 0) + 1);
-        }
-        for (const p of m.people ?? []) {
-          people.set(p, (people.get(p) || 0) + 1);
-        }
+      if (error) {
+        return toToolResult<ThoughtStatsOutput>({
+          error: `Error: ${error.message}`,
+          guidance: "An unexpected error occurred while fetching statistics.",
+        });
       }
 
-      // Top 10 per category keeps the response concise; adjust if needed.
-      const sort = (map: Map<string, number>): [string, number][] =>
-        Array.from(map.entries())
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 10);
+      const stats = data as {
+        total: number;
+        oldest: string;
+        newest: string;
+        types: Record<string, number>;
+        topics: Record<string, number>;
+        people: Record<string, number>;
+      };
 
-      // Results are newest-first, so at(-1) is the oldest and at(0) is the newest.
-      const date_range = data?.length
-        ? new Date(data.at(-1)?.created_at || "").toLocaleDateString() +
+      const date_range = stats.oldest && stats.newest
+        ? new Date(stats.oldest).toLocaleDateString() +
           " → " +
-          new Date(data.at(0)?.created_at || "").toLocaleDateString()
+          new Date(stats.newest).toLocaleDateString()
         : "N/A";
 
       return toToolResult<ThoughtStatsOutput>({
-        // Supabase returns null when count is unavailable; coerce to undefined
-        // so the value satisfies z.number().optional() (which rejects null).
-        total: count ?? undefined,
+        total: stats.total,
         date_range,
-        types: Object.fromEntries(sort(types)),
-        topics: Object.fromEntries(sort(topics)),
-        people: Object.fromEntries(sort(people)),
+        types: stats.types,
+        topics: stats.topics,
+        people: stats.people,
       });
     } catch (err) {
       return toToolResult<ThoughtStatsOutput>({
