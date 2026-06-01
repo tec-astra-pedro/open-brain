@@ -42,9 +42,9 @@ BEGIN
         'total', o.total,
         'oldest', o.oldest,
         'newest', o.newest,
-        'types', (SELECT jsonb_object_agg(key, val) FROM type_counts),
-        'topics', (SELECT jsonb_object_agg(key, val) FROM topic_counts),
-        'people', (SELECT jsonb_object_agg(key, val) FROM people_counts)
+        'types', COALESCE((SELECT jsonb_object_agg(key, val) FROM type_counts), '{}'::jsonb),
+        'topics', COALESCE((SELECT jsonb_object_agg(key, val) FROM topic_counts), '{}'::jsonb),
+        'people', COALESCE((SELECT jsonb_object_agg(key, val) FROM people_counts), '{}'::jsonb)
     ) INTO result
     FROM overall o;
 
