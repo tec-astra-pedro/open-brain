@@ -14,4 +14,6 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno check supabase/functions/open_brain_mcp/index.ts
+      - name: Type-check
+        working-directory: supabase/functions/open_brain_mcp
+        run: deno check index.ts

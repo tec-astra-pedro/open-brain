@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The whole project is one Deno module: `supabase/functions/open_brain_mcp/` (dependencies pinned in its `deno.json`, no `node_modules`).
 
 ### Build and Run
-- **Type-check**: `deno check supabase/functions/open_brain_mcp/index.ts`
+- **Type-check**: `cd supabase/functions/open_brain_mcp && deno check index.ts` — run `deno check` from the repo root against the full path and it silently fails to find `deno.json`, reporting every import (`hono`, `zod`, `@supabase/supabase-js`, etc.) as "not a dependency"; `deno run` doesn't have this quirk, but `cd`-ing first works for both and is the form CI uses.
 - **Run locally**: `deno run --allow-net --allow-env supabase/functions/open_brain_mcp/index.ts` (needs the env vars below)
 - **Serve via Supabase CLI** (matches the production edge runtime exactly): `supabase functions serve open_brain_mcp`
 - **Deploy**: `supabase functions deploy open_brain_mcp`
