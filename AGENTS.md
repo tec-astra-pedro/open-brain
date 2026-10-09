@@ -1,57 +1,66 @@
 # AGENTS.md (also CLAUDE.md)
 
-This file provides guidance to coding agents when working with code in this repository.
+This file provides guidance to coding agents (Claude Code, Codex, etc.) when working with code in this repository.
 
-## What this is
+## Development Commands
 
-Open Brain is an MCP server that gives AI agents a shared, semantic-searchable memory ("thoughts"). It's a single Supabase Edge Function (Deno/TypeScript, `supabase/functions/open_brain_mcp/index.ts`) backed by a Postgres/pgvector database, using OpenRouter for embeddings and metadata extraction.
+The whole project is one Deno module: `supabase/functions/open_brain_mcp/` (dependencies pinned in its `deno.json`, no `node_modules`).
 
-## Commands
+### Build and Run
+- **Type-check**: `cd supabase/functions/open_brain_mcp && deno check index.ts` — run `deno check` from the repo root against the full path and it silently fails to find `deno.json`, reporting every import (`hono`, `zod`, `@supabase/supabase-js`, etc.) as "not a dependency"; `deno run` doesn't have this quirk, but `cd`-ing first works for both and is the form CI uses.
+- **Run locally**: `deno run --allow-net --allow-env supabase/functions/open_brain_mcp/index.ts` (needs the env vars below)
+- **Serve via Supabase CLI** (matches the production edge runtime exactly): `supabase functions serve open_brain_mcp`
+- **Deploy**: `supabase functions deploy open_brain_mcp`
+- **Apply schema**: `supabase db push` (runs `supabase/schema/*.sql` in numeric order — see Structure below)
 
-All work happens inside `supabase/functions/open_brain_mcp/` (a Deno project with its own `deno.json`).
+Required env vars (Supabase function secrets, or a local `--env-file`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, `MCP_ACCESS_KEY`, and optionally `OPEN_BRAIN_CITATION_BASE_URL`.
 
-```bash
-# Type-check the function
-deno check supabase/functions/open_brain_mcp/index.ts
+### Testing
+There is no test suite or linter in this repo; CI (`.github/workflows/ci.yml`) runs only `deno check`, so that is the only automated verification available — after any change to `index.ts`, also manually exercise the affected tool via `supabase functions serve` plus an MCP client (or curl with `x-brain-key`) before considering the change done, since schema drift between a tool's Zod `outputSchema` and the object it actually returns will not throw (see SDK Notes below) and won't be caught by type-checking alone.
 
-# Run the function locally (requires env vars below)
-deno run --allow-net --allow-env supabase/functions/open_brain_mcp/index.ts
+## Code Architecture
 
-# Serve via the Supabase CLI (matches production edge runtime)
-supabase functions serve open_brain_mcp
+This is a single Supabase Edge Function implementing an MCP server for a shared, semantic-searchable AI memory ("thoughts"). See [docs/architecture.md](docs/architecture.md) for the full data-flow diagrams; the essentials:
 
-# Deploy
-supabase functions deploy open_brain_mcp
+### Structure
+- `supabase/functions/open_brain_mcp/index.ts` — the entire server: type defs, OpenRouter helpers, all 6 MCP tool registrations, and the Hono app/auth/CORS layer. There is no other source file.
+- `supabase/schema/*.sql` — numbered, applied in order: `1_thoughts_table`, `2_semantic_search_function` (`match_thoughts` RPC), `3_row_level_security`, `4_grant_service_role_access`, `5_deduplication` (`content_fingerprint` column + `upsert_thought` RPC), `6_get_thought_stats_function` (`get_thought_stats` RPC). Treat these as an ordered migration log, not a single schema file — a change to the `thoughts` table shape should be a new numbered file, not an edit to `1_thoughts_table.sql`.
+- `docs/architecture.md` — the authoritative architecture writeup (component diagram, capture/search data flows, operational principles). Read it before making structural changes.
 
-# Apply schema changes (run schema/*.sql in order against the Supabase project)
-supabase db push
-```
+### Key Technologies
+- **Runtime**: Deno, deployed as a Supabase Edge Function
+- **Web framework**: Hono, via `@hono/mcp`'s `StreamableHTTPTransport` for the MCP protocol layer
+- **MCP SDK**: `@modelcontextprotocol/sdk` (pinned `1.24.3` in `deno.json`)
+- **Validation**: `zod` (pinned `4.1.13`)
+- **DB client**: `@supabase/supabase-js`, using the service-role key — RLS restricts all table access to `service_role` (`supabase/schema/3_row_level_security.sql`), so the function is the only writer/reader
+- **LLM/embeddings**: OpenRouter — `openai/text-embedding-3-small` for embeddings, `openai/gpt-4o-mini` (JSON mode) for metadata extraction
 
-There is no test suite or linter configured in this repo currently.
+### Request lifecycle
+One shared `McpServer` instance lives for the life of the function; a new `StreamableHTTPTransport` is created per request (`app.all("*", ...)` in `index.ts`) since the transport is stateful per-connection but the server registration isn't. Every request must carry `x-brain-key` (header or `?key=` query param) matching `MCP_ACCESS_KEY`, checked before the transport is created.
 
-Required env vars (set as Supabase function secrets, or locally via `.env`/`--env-file`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, `MCP_ACCESS_KEY`, and optionally `OPEN_BRAIN_CITATION_BASE_URL`.
+### The 6 registered tools
+- `search` / `fetch` — read-only pair with the exact tool shape ChatGPT connectors/deep research expect. Don't rename their fields (`thought_id`/`title`/`url` for search results) without checking that compatibility contract.
+- `search_thoughts`, `list_thoughts`, `thought_stats` — richer read tools for other MCP clients (Claude, etc.).
+- `capture_thought` — the only write path.
 
-## Architecture
+### Capture flow
+`capture_thought` runs embedding generation and metadata extraction in parallel (`Promise.all`), then calls the `upsert_thought` Postgres RPC — which fingerprints content via SHA256 and either inserts or merges metadata into an existing row keyed by `content_fingerprint`. The embedding is written back with a **separate** `update` call afterward, because `upsert_thought` can't accept a `vector` parameter directly. This means a thought can briefly exist with content/metadata but no embedding (unsearchable) if the process dies between the two calls — this is intentional (see "safe-capture" below), not a bug to "fix" by merging the calls.
 
-See [docs/architecture.md](docs/architecture.md) for the full picture; the essentials:
+### Search flow
+Query text → embedding (OpenRouter) → `match_thoughts` RPC (pgvector cosine similarity over an HNSW index, with an optional JSONB `@>` containment filter). `match_thoughts` returns a column named `id`; the tool handlers map that to the client-facing `thought_id` field — don't rename the RPC's `id` column or the mapping breaks silently (this regressed once, see commit `7a1bc50`).
 
-- **Single entrypoint**: `supabase/functions/open_brain_mcp/index.ts` is a Hono app wrapping an `McpServer` (from `@modelcontextprotocol/sdk`). A new `StreamableHTTPTransport` is created per request; the `McpServer` instance itself is shared/stateless across requests.
-- **Auth**: every request must carry `x-brain-key` header (or `?key=` query param) matching `MCP_ACCESS_KEY`. Failures return a JSON-RPC error envelope with HTTP 200 (not a bare 401) — strict MCP hosts like Claude Code/Codex tear down the connection on transport-level 4xx, so auth/protocol errors must stay inside the JSON-RPC envelope.
-- **Six MCP tools registered on the server**:
-  - `search` / `fetch` — ChatGPT-compatible read-only pair (exact tool shape required for ChatGPT connectors/deep research).
-  - `search_thoughts`, `list_thoughts`, `thought_stats` — richer read tools for other MCP clients.
-  - `capture_thought` — the only write path.
-- **Capture flow**: `capture_thought` runs embedding generation (OpenRouter `text-embedding-3-small`) and metadata extraction (OpenRouter `gpt-4o-mini`, JSON mode) in parallel, then calls the `upsert_thought` Postgres RPC (handles SHA256-fingerprint-based dedup + metadata merge on conflict), then writes the embedding back with a separate `update` call (the RPC can't accept a vector param directly).
-- **Search flow**: query text → embedding → `match_thoughts` RPC (pgvector cosine similarity via HNSW index, with optional JSONB metadata containment filter).
-- **Database** (`supabase/schema/*.sql`, applied in numeric order): `thoughts` table (`content`, `embedding vector(1536)`, `metadata jsonb`, `content_fingerprint`), `match_thoughts` and `get_thought_stats` RPC functions, RLS restricted to `service_role`.
-- **Operational principles** (see architecture doc): append-only integrity (no destructive overwrites), safe-capture (text is saved before enrichment completes so nothing is lost if embedding/metadata calls fail), all external access goes through the edge function's `service_role` — clients never touch Postgres directly.
+### Operational principles (from docs/architecture.md)
+- **Append-only integrity**: updates merge/refine rather than overwrite; don't add destructive update paths.
+- **Safe-capture pattern**: content is persisted before enrichment (embedding/metadata) completes, so a failure in the OpenRouter calls never loses the raw thought — it just stays temporarily unsearchable/under-tagged.
+- **Security through isolation**: all external access goes through the edge function's `service_role`; clients never get direct Postgres credentials.
+
+## Git Workflow
+
+`main` is branch-protected: direct pushes are rejected, and merging requires the `type-check` CI check (`.github/workflows/ci.yml`, runs `deno check`) to pass. For any change beyond a one-line doc fix: create a feature branch, commit there, push it, and open a PR into `main`. There's no way around the PR step — plan for the branch+PR up front.
 
 ## MCP SDK Notes
-
-- Installed version: check `node_modules/@modelcontextprotocol/sdk/package.json` (types live in `dist/esm/types.d.ts`, runtime behavior in `dist/esm/server/index.js`) — don't assume spec behavior without checking the installed version, the SDK's surface changes across releases.
-- If a tool declares `outputSchema`, the `CallToolRequestSchema` handler must also return `structuredContent` matching it — the SDK does **not** auto-populate `structuredContent` from `content`, and does **not** validate the two against each other or against `outputSchema` at runtime. A drift between them will not throw; it has to be caught by tests.
-- For `Tool`, both a top-level `title` and `annotations.title` are valid fields, but `annotations.title` takes precedence if both are set — set only one.
-
-## Conventions in this file
-
-Comments in `index.ts` are used deliberately to explain *why*, not *what* — e.g. why the Accept header gets patched for Claude Desktop, why auth errors use a JSON-RPC envelope instead of HTTP 401, why the embedding write is a separate call from the upsert. Preserve that style when editing.
+- If a tool declares `outputSchema`, the handler must build a matching `structuredContent` object itself — the SDK does not auto-populate or validate `structuredContent` against `outputSchema`/`content` at runtime. Every tool here funnels through `toToolResult<T>()` to keep the two in sync; use it rather than constructing `CallToolResult` by hand.
+- `inputSchema` takes a plain Zod raw shape (object of fields), not a `z.object(...)` — the SDK wraps it internally. `outputSchema` is the opposite: a full `z.object(...)`.
+- A zero-argument tool (`thought_stats`) still needs `inputSchema: {}` — omitting it is invalid for this SDK version.
+- Auth/protocol failures are returned as JSON-RPC error envelopes over HTTP 200, not bare 4xx — strict MCP hosts (Claude Code, Codex CLI) treat a transport-level 4xx as a fatal connection error rather than an application error, so `unauthorizedResponse()` in `index.ts` deliberately stays inside the JSON-RPC envelope.
+- Claude Desktop's connector client omits the `Accept: text/event-stream` header `StreamableHTTPTransport` expects; `index.ts` patches the request headers before handing off to the transport if it's missing. Don't remove this without confirming Claude Desktop connectors still work (see the linked issue in the code comment).
